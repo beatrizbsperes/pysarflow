@@ -54,9 +54,12 @@ plugins:
               show_root_heading: true
               show_docstring: true
               show_submodules: true
+  - exclude:
+      glob:
+        - data/**
 
 nav :
- - Home: home.md
+ - Home: index.md
  - Reference: reference.md
  - Contribute: dev.md
  - Examples:
