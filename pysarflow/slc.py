@@ -34,11 +34,15 @@ import geopandas as gpd
 import xml.etree.ElementTree as ET
 import matplotlib.pyplot as plt
 from datetime import datetime
+from matplotlib.colors import hsv_to_rgb
+import subprocess
+
+Integer = jpy.get_type('java.lang.Integer')
 
 
 def read_slc_product(product_path):
     """
-    Reads a Sentinel-1 GRD product using SNAP's ProductIO.
+    Reads a Sentinel-1 SLC product using SNAP's ProductIO.
 
     This function checks whether the provided product path exists on disk, then
     attempts to load the product using ProductIO.readProduct. If the product
@@ -61,7 +65,7 @@ def read_slc_product(product_path):
         return product
     except Exception as e:
         raise RuntimeError(
-            f"An error occurred while reading the grd product: {str(e)}"
+            f"An error occurred while reading the slc product: {str(e)}"
         ) from e
 
 def burst_for_geometry(product, safe_dir, geom, subswath=None):
@@ -69,7 +73,7 @@ def burst_for_geometry(product, safe_dir, geom, subswath=None):
     Determine TOPS burst index (or range) for a geometry in a Sentinel-1 IW SLC.
 
     Args:
-      product   : SNAP Product (ProductIO.readProduct(...))
+      product   : Input SAR product.
       safe_dir  : path to the *.SAFE folder (str or Path)
       geom      : Shapely Point/Polygon, or WKT string, or bbox tuple (minlon,minlat,maxlon,maxlat)
       subswath  : optional 'IW1'|'IW2'|'IW3' to force a swath
@@ -85,6 +89,17 @@ def burst_for_geometry(product, safe_dir, geom, subswath=None):
         'lastBurst': 6,          # for Polygon
         'geom_type': 'Point'|'Polygon'
       }
+
+    Raises:
+
+        ValueError: 
+        - If geom is not a Shapely Point/Polygon, a WKT string, or a 4-element bbox ``(minx, miny, maxx, maxy)``
+        - If the geometry lies outside the products IW1/IW2/IW3 coverage.
+        - If the AOI polygon does not intersect the chosen sub-swath.
+
+        FileNotFoundError:
+        - If no annotation XML file is found for the selected sub-swath
+
     """
 
     # --- normalize geometry ---
@@ -163,7 +178,7 @@ def burst_for_geometry(product, safe_dir, geom, subswath=None):
         linesPerBurst = max(1, (first_lines[1] - first_lines[0]) if len(first_lines) == 2 else H // max(1, numberOfBursts))
 
     out = {
-        "swath": chosen_sw,
+        "sub-swath": chosen_sw,
         "band_name": chosen_band_name,
         "linesPerBurst": linesPerBurst,
         "numberOfBursts": numberOfBursts,
@@ -191,6 +206,186 @@ def burst_for_geometry(product, safe_dir, geom, subswath=None):
 
     return out
 
+def topsar_split(product, burst_dict, pols=None, output_complex=True):
+    """
+    Run TOPSAR-Split using burst indices from burst_for_geometry(...).
+
+    Args:
+      product : Input SAR product. Output of the burst_for_geometry
+      burst_dict : output from the burst_for_geometry function
+      pols = polarization
+
+    Returns
+        Product restricted to the specified sub-swath, burst range, and polarisations.
+    """
+    band = burst_dict['band_name']              # e.g. 'i_IW1_VH'
+    swath = next(iw for iw in ['IW1','IW2','IW3','EW1','EW2','EW3','EW4','EW5'] if iw in band)
+
+    if pols is None:
+        pols = band.split('_')[-1]              # infer polarisation from band name
+
+    if burst_dict['geom_type'] == 'Point':
+        fb = lb = int(burst_dict['burst'])
+    else:
+        fb, lb = int(burst_dict['firstBurst']), int(burst_dict['lastBurst'])
+        if fb > lb: fb, lb = lb, fb
+
+    # Build parameters
+    parameters = HashMap()
+    parameters.put('subswath', swath)
+    parameters.put('selectedPolarisations', pols)
+    parameters.put('firstBurstIndex', Integer(fb))
+    parameters.put('lastBurstIndex', Integer(lb))
+    parameters.put('outputComplex', bool(output_complex))
+
+    # Run TOPSAR-Split
+    output = GPF.createProduct("TOPSAR-Split", parameters, product)
+    print(f"TOPSAR-Split applied: {swath} bursts {fb}–{lb} ({pols})")
+    return output
+
+
+def apply_orbit(product,
+                orbit_type="Sentinel Precise (Auto Download)"):
+    """
+    Run SNAP 'Apply-Orbit-File' on a Product.
+
+    Args:
+        product:
+            Input product to process. Ouput of TOPSAR-split
+        orbit_type:
+            The orbit source/type to use. Common values include:
+              - `"Sentinel Precise (Auto Download)"` – preferred.
+              - `"Sentinel Restituted (Auto Download)"` – fallback if precise is not yet available.
+              - `"DORIS Precise VOR (ENVISAT)"` – for other missions.
+
+    Returns:
+        Product: A new SNAP `Product` with orbits applied.
+    """
+    Boolean = jpy.get_type('java.lang.Boolean')
+    Integer = jpy.get_type('java.lang.Integer')
+
+    parameters = HashMap()
+    parameters.put("orbitType", orbit_type)
+    parameters.put("polyDegree", Integer(3))
+    parameters.put("continueOnFail", Boolean(True))
+
+    out = GPF.createProduct("Apply-Orbit-File", parameters, product)
+    print(f"Apply-Orbit-File: {orbit_type}")
+    return out
+
+def back_geocoding(products, dem_name="SRTM 1Sec HGT", ext_dem=None):
+    """
+    Run SNAP Back-Geocoding on master + slave(s).
+
+    Args:
+        master   : SNAP Product (Apply-Orbit-File already done). Output of the apply orbit
+        slaves   : list of SNAP Products (Apply-Orbit-File already done). Output of the apply orbit 
+        dem_name : name of DEM in SNAP auxdata (default SRTM 1Sec HGT)
+        ext_dem  : optional external DEM product
+
+    Returns:
+        SNAP Product with master + co-registered slave or slaves
+    """
+    print("Running Back-Geocoding...")
+
+    parameters = HashMap()
+    parameters.put("demName", dem_name)
+    parameters.put("demResamplingMethod", "BILINEAR_INTERPOLATION")
+    parameters.put("resamplingType", "BILINEAR_INTERPOLATION")
+    parameters.put("maskOutAreaWithoutElevation", True)
+    parameters.put("outputDerampDemodPhase", True)
+    parameters.put("disableReramp", False)
+
+
+    if ext_dem is not None:
+        parameters.put("externalDEMFile", ext_dem)
+
+    output = GPF.createProduct("Back-Geocoding", parameters, products) 
+    print("Back geocoding applied!")
+    return output
+
+def enhanced_spectral_diversity(product, preset="default", **overrides):
+    """
+    Enhanced Spectral Diversity (ESD) with sensible defaults + optional overrides.
+
+     Args:
+        product:
+            A SNAP `Product` — usually the output of Back-Geocoding
+            containing the master and one or more slave images.
+        preset:
+            Convenience preset passed to `esd_parameters(preset)` that supplies a
+            default parameter set. Expected values:
+            - `"default"` - full computation.
+            - `"fast"`  – less lighter computation.
+            - `"faster"`    – lighter computation.
+        **overrides:
+            Any ESD operator parameter you want to force/override from the
+            preset (e.g., `cohWinAz=5`, `cohWinRg=10`, `maxIterations=25`,
+            etc.). Keys must match the operator's parameter names.
+
+    Returns:
+        Product: A new SNAP `Product` with ESD refinement applied.
+    """
+    parameters = HashMap()
+    for k, v in esd_parameters(preset).items():
+        parameters.put(k, v)
+    # user overrides win if provided
+    for k, v in overrides.items():
+        parameters.put(k, v)
+    esd = GPF.createProduct("Enhanced-Spectral-Diversity", parameters, product)
+    return esd
+
+
+def esd_parameters(preset): #enhanced spectral diversity parameters
+    Boolean = jpy.get_type('java.lang.Boolean')
+    if preset == "fast":
+        # more forgiving in low coherence, a bit slower
+        return {
+            "cohThreshold": 0.15,            # default often ~0.2
+            "xCorrThreshold": 0.05,
+            "fineWinWidthStr": "512",
+            "fineWinHeightStr": "512",
+            "fineWinAccAzimuth": "16",
+            "fineWinAccRange": "16",
+            "fineWinOversampling": "128",
+            "estimateAzimuthShift": Boolean(True),
+            "estimateRangeShift":   Boolean(False),
+            "doNotWriteTargetBands": Boolean(False),
+        }
+    if preset == "faster":
+        # quicker; good for previews
+        return {
+            "cohThreshold": 0.2,
+            "xCorrThreshold": 0.1,
+            "fineWinWidthStr": "256",
+            "fineWinHeightStr": "256",
+            "estimateAzimuthShift": Boolean(True),
+            "estimateRangeShift":   Boolean(False),
+            "doNotWriteTargetBands": Boolean(True),  # smaller output
+        }
+    # default
+    return {
+        # let SNAP defaults mostly apply; set only stable keys
+        "fineWinWidthStr": "512",
+        "fineWinHeightStr": "512",
+        "fineWinAccAzimuth": "16",
+        "fineWinAccRange": "16",
+        "fineWinOversampling": "128",
+        "esdEstimator": "Periodogram",
+        "weightFunc": "Inv Quadratic",
+        "temporalBaselineType": "Number of images",
+        "integrationMethod": "L1 and L2",
+        "xCorrThreshold": 0.1,
+        "cohThreshold": 0.3,
+        "overallRangeShift": 0.0,
+        "overallAzimuthShift": 0.0,
+        "numBlocksPerOverlap": Integer(10),
+        "maxTemporalBaseline":Integer(2),
+        "doNotWriteTargetBands": False,
+        "useSuppliedRangeShift": False,
+        "useSuppliedAzimuthShift": False
+
+    }
 
 def temporal_baseline(product1_path, product2_path):
     """
@@ -201,7 +396,7 @@ def temporal_baseline(product1_path, product2_path):
     commonly used in interferometric SAR (InSAR) analysis to assess the temporal 
     separation between image acquisitions.
 
-    Parameters:
+    Args:
     ----------
     product1_path : str
         File path to the first Sentinel-1 product (e.g., the master image).
@@ -219,8 +414,8 @@ def temporal_baseline(product1_path, product2_path):
     - It assumes that both products contain valid start time metadata.
     - Resources are released after processing by calling `.dispose()` on each product.
     """
-    product1 =  read_product(product1_path)
-    product2 =  read_product(product2_path)
+    product1 =  read_slc_product(product1_path)
+    product2 =  read_slc_product(product2_path)
     master_time = product1.getStartTime()
     slave_time = product2.getStartTime()
     temporal_baseline = abs(slave_time.getMJD() - master_time.getMJD())
@@ -242,7 +437,7 @@ def interferogram(product):
     interferometric SAR (InSAR) processing for deriving surface deformation, 
     elevation models, or coherence analysis.
 
-    Parameters:
+    Args:
     ----------
     product : org.esa.snap.core.datamodel.Product
         The co-registered Sentinel-1 product (usually the output of the 
@@ -279,6 +474,62 @@ def interferogram(product):
     output = GPF.createProduct("Interferogram", parameters, product) 
     print("Interferogram created!")
     return output
+  
+def topsar_deburst(product, polarization):  
+    """
+    Apply TOPSAR deburst operation to a Sentinel-1 product.
+
+    This function removes burst discontinuities in TOPSAR acquisitions 
+    by merging bursts into a seamless image for the specified polarization. 
+    It is a necessary preprocessing step for Sentinel-1 TOPSAR IW and EW 
+    data before further interferometric or geocoding analysis.
+
+    Args
+    ----------
+    product : snappy.Product
+        The input Sentinel-1 product to which the deburst operation will be applied.
+    polarization : str
+        The polarization channel to process (e.g., 'VV', 'VH', 'HH', 'HV').
+
+    Returns
+    -------
+    snappy.Product
+        The deburst-processed Sentinel-1 product.
+    """
+    parameters = HashMap()
+    print('Apply TOPSAR Deburst...')
+    parameters.put("Polarisations", polarization)
+    output = GPF.createProduct("TOPSAR-Deburst", parameters, product)
+    print("TOPSAR Deburst applied!")
+    return output  
+
+def multilooking(product, n_rg=3, n_az=1, source_bands=None, output_intensity=False):
+    """
+    SNAP 'Multilook' operator.
+
+    Args:
+      product         : SNAP Product (typically AFTER TOPSAR-Deburst)
+      n_rg (int)      : number of looks in range (speckle ↓, res ↓)
+      n_az (int)      : number of looks in azimuth
+      source_bands    : optional list/CSV of bands to process (e.g. 'i_*,q_*,coh_*')
+      output_intensity: for complex inputs, also write intensity bands
+
+    Returns:
+      SNAP Product with multilooked bands
+    """
+    Integer = jpy.get_type('java.lang.Integer')
+    Boolean = jpy.get_type('java.lang.Boolean')
+
+    parameters = HashMap()
+    parameters.put('nRgLooks', Integer(n_rg))
+    parameters.put('nAzLooks', Integer(n_az))
+    parameters.put('outputIntensity', Boolean(output_intensity))
+    if source_bands:
+        if isinstance(source_bands, (list, tuple)):
+            source_bands = ",".join(source_bands)
+        parameters.put('sourceBands', str(source_bands))
+
+    return GPF.createProduct('Multilook', parameters, product)
 
 def goldstein_phase_filtering(product):
     """
@@ -289,7 +540,7 @@ def goldstein_phase_filtering(product):
     the phase fringes, improving the quality of unwrapping and subsequent deformation 
     analysis.
 
-    Parameters:
+    Args:
     ----------
     product : org.esa.snap.core.datamodel.Product
         The input product containing the interferometric phase, typically the 
@@ -325,6 +576,170 @@ def goldstein_phase_filtering(product):
     print("Goldstein Phase Filtering applied!")
     return output
 
+def snaphu_export(xml_path, new_input_file, new_target_folder):
+    """
+    Modify a SNAP XML graph to update input and output paths, then execute it using GPT.
+
+    This function updates the SNAP XML workflow file by:
+    - Replacing the file path in the 'Read' node with the given input file.
+    - Replacing the target folder in the 'SnaphuExport' node with the given output folder.
+    After updating, it saves the modified XML and runs the graph using the `gpt` command-line tool.
+
+    Args
+    ----------
+    xml_path : str
+        Path to the SNAP XML graph file to be modified and executed.
+    new_input_file : str
+        Path to the new input file (to replace the one in the 'Read' node).
+    new_target_folder : str
+        Path to the new target folder (to replace the one in the 'SnaphuExport' node).
+
+    Returns
+    -------
+    None
+        The function prints progress updates and the output of the `gpt` execution.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the provided `xml_path` does not exist.
+    xml.etree.ElementTree.ParseError
+        If the XML file cannot be parsed.
+    subprocess.CalledProcessError
+        If the `gpt` command execution fails.
+
+    Notes
+    -----
+    - Requires SNAP's Graph Processing Tool (`gpt`) to be installed and available in the system PATH.
+    - The XML graph must contain nodes with IDs 'Read' and 'SnaphuExport' for the function to work correctly.
+    """
+    print("Snaphu exporting...")
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    for node in root.findall(".//node[@id='Read']/parameters/file"):
+        node.text = new_input_file
+
+    for node in root.findall(".//node[@id='SnaphuExport']/parameters/targetFolder"):
+        node.text = new_target_folder
+
+    tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
+
+    gpt_command = "gpt"  
+    result = subprocess.run([gpt_command, xml_path], capture_output=True, text=True, check=True)
+    print("Processing complete.\nOutput:\n", result.stdout)
+
+def snaphu_unwrapping(conf_file_path, snaphu_exe_path, output_directory):
+    """
+    Run the SNAPHU unwrapping process using a configuration file.
+
+    This function reads a SNAPHU configuration file, extracts the command line 
+    arguments, and executes the SNAPHU binary with those arguments in the specified 
+    output directory. It ensures the working directory exists before execution and 
+    reports success or failure after completion.
+
+    Args
+    ----------
+    conf_file_path : str
+        Path to the SNAPHU configuration file (typically generated by SNAP or manually prepared).
+    snaphu_exe_path : str
+        Path to the SNAPHU executable to be used for unwrapping.
+    output_directory : str
+        Directory where SNAPHU will be executed and output files will be stored.
+
+    Returns
+    -------
+    bool
+        True if SNAPHU unwrapping completed successfully (return code 0), 
+        False otherwise.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the configuration file does not exist.
+    IndexError
+        If the configuration file has fewer than 7 lines (expected command at line 7).
+    subprocess.SubprocessError
+        If there is an unexpected error while executing the SNAPHU command.
+
+    Notes
+    -----
+    - The function assumes that the unwrapping command is located on line 7 of the configuration file.
+    - Any leading '#' or 'snaphu' prefixes in the command line will be stripped before execution.
+    - Requires SNAPHU to be compiled and available at the specified `snaphu_exe_path`.
+    """
+    with open(conf_file_path, 'r') as file:
+        lines = file.readlines()
+        
+    if len(lines) <= 6:
+        raise IndexError("Configuration file doesn't have enough lines")
+        
+    command_line = lines[6].strip()
+    
+    if command_line.startswith('#'):
+        command_line = command_line[1:].strip()
+    if command_line.startswith('snaphu'):
+        command_line = command_line[6:].strip()
+    
+    full_command = f'"{snaphu_exe_path}" {command_line}'
+    
+    print(f"Running SNAPHU command: {full_command}")
+    print(f"Working directory: {output_directory}")
+    
+    os.makedirs(output_directory, exist_ok=True)
+    
+    result = subprocess.run(
+        full_command,
+        cwd=output_directory,
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode == 0:
+        print("SNAPHU unwrapping completed successfully!")
+        print("Output:", result.stdout)
+    else:
+        print("SNAPHU unwrapping failed!")
+        print("Error:", result.stderr)
+        print("Return code:", result.returncode)
+    return result.returncode == 0
+
+def snaphu_import(source_product, unwrapped_product): 
+    """
+    Import SNAPHU unwrapped interferogram results back into SNAP.
+
+    This function uses SNAP's Graph Processing Framework (GPF) to merge the 
+    unwrapped interferogram produced by SNAPHU with the original source product. 
+    The resulting product contains the unwrapped phase information, making it 
+    available for further processing within SNAP.
+
+    Args
+    ----------
+    source_product : snappy.Product
+        The original interferogram product before SNAPHU unwrapping.
+    unwrapped_product : snappy.Product
+        The product containing the SNAPHU unwrapped interferogram.
+
+    Returns
+    -------
+    snappy.Product
+        A SNAP product containing the imported unwrapped phase data.
+
+    Notes
+    -----
+    - The parameter `'doNotKeepWrapped'` is set to False to keep the wrapped phase 
+      along with the unwrapped phase.
+    - Requires SNAP's snappy module and the GPF operator `'SnaphuImport'`.
+    """ 
+    parameters = HashMap()
+    print("SNAPHU importing...")
+    parameters.put('doNotKeepWrapped', False)
+    products = [source_product, unwrapped_product]
+    output = GPF.createProduct('SnaphuImport', parameters, products)
+    print("SNAPHU imported...")
+    return output
+
 def phase_to_elevation(product, DEM):
     """
     Convert unwrapped interferometric phase to elevation using a Digital Elevation Model (DEM).
@@ -334,7 +749,7 @@ def phase_to_elevation(product, DEM):
     elevation map by referencing a known DEM. This step is commonly used in 
     Differential InSAR (DInSAR) or when generating DEMs from SAR data.
 
-    Parameters:
+    Args:
     ----------
     product : org.esa.snap.core.datamodel.Product
         The input product containing unwrapped interferometric phase, typically 
@@ -367,124 +782,170 @@ def phase_to_elevation(product, DEM):
     print("Phase to Elevation applied!")
     return output
 
-
-def apply_orbit_file(product):
+def snaphu_export(xml_path, new_input_file, new_target_folder):
     """
-    Apply precise orbit files to a Sentinel-1 product.
+    Modify a SNAP XML graph to update input and output paths, then execute it using GPT.
 
-    This function uses the SNAP Graph Processing Framework (GPF) to 
-    automatically download and apply the latest available Sentinel 
-    Precise Orbit Ephemerides (POEORB) to the input product. Orbit 
-    information improves geolocation accuracy and is a required step 
-    before interferometric or other advanced SAR processing.
+    This function updates the SNAP XML workflow file by:
+    - Replacing the file path in the 'Read' node with the given input file.
+    - Replacing the target folder in the 'SnaphuExport' node with the given output folder.
+    After updating, it saves the modified XML and runs the graph using the `gpt` command-line tool.
 
     Parameters
     ----------
-    product : snappy.Product
-        The Sentinel-1 product to which the precise orbit file 
-        will be applied.
+    xml_path : str
+        Path to the SNAP XML graph file to be modified and executed.
+    new_input_file : str
+        Path to the new input file (to replace the one in the 'Read' node).
+    new_target_folder : str
+        Path to the new target folder (to replace the one in the 'SnaphuExport' node).
 
     Returns
     -------
-    snappy.Product
-        A new product with updated orbit state vectors.
+    None
+        The function prints progress updates and the output of the `gpt` execution.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the provided `xml_path` does not exist.
+    xml.etree.ElementTree.ParseError
+        If the XML file cannot be parsed.
+    subprocess.CalledProcessError
+        If the `gpt` command execution fails.
 
     Notes
     -----
-    - If no new orbit file is available, the process will not fail 
-      and the product will still be returned with existing orbit 
-      information.
-    - Polynomial degree 3 is used for orbit interpolation.
-
-    Examples
-    --------
-    >>> updated_product = apply_orbit_file(product)
-    >>> print(updated_product)
+    - Requires SNAP's Graph Processing Tool (`gpt`) to be installed and available in the system PATH.
+    - The XML graph must contain nodes with IDs 'Read' and 'SnaphuExport' for the function to work correctly.
     """
-    parameters = HashMap()
-    print('Apply Orbit File...')
-    parameters.put("Orbit State Vectors", "Sentinel Precise (Auto Download)")
-    parameters.put("Polynomial Degree", 3)
-    parameters.put("Do not fail if new orbit file is not found", True)
-    output = GPF.createProduct("Apply-Orbit-File", parameters, product)
-    print("Orbit File applied!") 
-    return output
+    print("Snaphu exporting...")
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
 
+    for node in root.findall(".//node[@id='Read']/parameters/file"):
+        node.text = new_input_file
 
-def back_geocoding(products, DEM):
+    for node in root.findall(".//node[@id='SnaphuExport']/parameters/targetFolder"):
+        node.text = new_target_folder
+
+    tree.write(xml_path, encoding="UTF-8", xml_declaration=True)
+
+    gpt_command = "gpt"  
+    result = subprocess.run([gpt_command, xml_path], capture_output=True, text=True, check=True)
+    print("Processing complete.\nOutput:\n", result.stdout)
+
+def snaphu_unwrapping(conf_file_path, snaphu_exe_path, output_directory):
     """
-    Apply Back-Geocoding to a stack of Sentinel-1 products using a specified DEM.
+    Run the SNAPHU unwrapping process using a configuration file.
 
-    This function aligns multiple Sentinel-1 SAR products into a common geometry 
-    based on the provided Digital Elevation Model (DEM). It applies bilinear 
-    interpolation for both DEM resampling and image resampling, masks out 
-    non-elevation areas, and includes options for spectral diversity and phase 
-    corrections.
+    This function reads a SNAPHU configuration file, extracts the command line 
+    arguments, and executes the SNAPHU binary with those arguments in the specified 
+    output directory. It ensures the working directory exists before execution and 
+    reports success or failure after completion.
 
     Parameters
     ----------
-    products : Product or list of Products
-        Input Sentinel-1 product(s) to be co-registered.
-    DEM : str
-        Name of the Digital Elevation Model (e.g., "SRTM 1Sec HGT" or a custom DEM path) 
-        to be used for the back-geocoding.
+    conf_file_path : str
+        Path to the SNAPHU configuration file (typically generated by SNAP or manually prepared).
+    snaphu_exe_path : str
+        Path to the SNAPHU executable to be used for unwrapping.
+    output_directory : str
+        Directory where SNAPHU will be executed and output files will be stored.
 
     Returns
     -------
-    Product
-        A new SNAP product containing the co-registered Sentinel-1 stack after 
-        back-geocoding.
+    bool
+        True if SNAPHU unwrapping completed successfully (return code 0), 
+        False otherwise.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the configuration file does not exist.
+    IndexError
+        If the configuration file has fewer than 7 lines (expected command at line 7).
+    subprocess.SubprocessError
+        If there is an unexpected error while executing the SNAPHU command.
+
+    Notes
+    -----
+    - The function assumes that the unwrapping command is located on line 7 of the configuration file.
+    - Any leading '#' or 'snaphu' prefixes in the command line will be stripped before execution.
+    - Requires SNAPHU to be compiled and available at the specified `snaphu_exe_path`.
+    """
+    with open(conf_file_path, 'r') as file:
+        lines = file.readlines()
+        
+    if len(lines) <= 6:
+        raise IndexError("Configuration file doesn't have enough lines")
+        
+    command_line = lines[6].strip()
     
-    Notes
-    -----
-    - DEM and image resampling are both performed using bilinear interpolation.
-    - Spectral diversity is disabled to improve co-registration in areas with 
-      temporal or spatial decorrelation.
-    - Outputs include deramped and demodulated phase bands.
-    """
-    parameters = HashMap()
-    print('Back geocoding ...')
-    parameters.put("Digital Elevation Model", DEM)
-    parameters.put("demResamplingMethod", "BILINEAR_INTERPOLATION")
-    parameters.put("resamplingType", "BILINEAR_INTERPOLATION")
-    parameters.put("maskOutAreaWithoutElevation", True)
-    parameters.put('disableSpectralDiversity', True)
-    parameters.put("outputDerampDemodPhase", True)
-    parameters.put("disableReramp", False)
-    #parameters.put("The list of source bands", "")
-    output = GPF.createProduct("Back-Geocoding", parameters, products) 
-    print("Back geocoding applied!")
-    return output
+    if command_line.startswith('#'):
+        command_line = command_line[1:].strip()
+    if command_line.startswith('snaphu'):
+        command_line = command_line[6:].strip()
+    
+    full_command = f'"{snaphu_exe_path}" {command_line}'
+    
+    print(f"Running SNAPHU command: {full_command}")
+    print(f"Working directory: {output_directory}")
+    
+    os.makedirs(output_directory, exist_ok=True)
+    
+    result = subprocess.run(
+        full_command,
+        cwd=output_directory,
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+    
+    if result.returncode == 0:
+        print("SNAPHU unwrapping completed successfully!")
+        print("Output:", result.stdout)
+    else:
+        print("SNAPHU unwrapping failed!")
+        print("Error:", result.stderr)
+        print("Return code:", result.returncode)
+    return result.returncode == 0
 
-def topsar_deburst(product, polarization):  
+def snaphu_import(source_product, unwrapped_product): 
     """
-    Apply TOPSAR deburst operation to a Sentinel-1 product.
+    Import SNAPHU unwrapped interferogram results back into SNAP.
 
-    This function removes burst discontinuities in TOPSAR acquisitions 
-    by merging bursts into a seamless image for the specified polarization. 
-    It is a necessary preprocessing step for Sentinel-1 TOPSAR IW and EW 
-    data before further interferometric or geocoding analysis.
+    This function uses SNAP's Graph Processing Framework (GPF) to merge the 
+    unwrapped interferogram produced by SNAPHU with the original source product. 
+    The resulting product contains the unwrapped phase information, making it 
+    available for further processing within SNAP.
 
     Parameters
     ----------
-    product : snappy.Product
-        The input Sentinel-1 product to which the deburst operation will be applied.
-    polarization : str
-        The polarization channel to process (e.g., 'VV', 'VH', 'HH', 'HV').
+    source_product : snappy.Product
+        The original interferogram product before SNAPHU unwrapping.
+    unwrapped_product : snappy.Product
+        The product containing the SNAPHU unwrapped interferogram.
 
     Returns
     -------
     snappy.Product
-        The deburst-processed Sentinel-1 product.
-    """
-    parameters = HashMap()
-    print('Apply TOPSAR Deburst...')
-    parameters.put("Polarisations", polarization)
-    output = GPF.createProduct("TOPSAR-Deburst", parameters, product)
-    print("TOPSAR Deburst applied!")
-    return output
+        A SNAP product containing the imported unwrapped phase data.
 
-def terrain_correction(product, DEM):
+    Notes
+    -----
+    - The parameter `'doNotKeepWrapped'` is set to False to keep the wrapped phase 
+      along with the unwrapped phase.
+    - Requires SNAP's snappy module and the GPF operator `'SnaphuImport'`.
+    """ 
+    parameters = HashMap()
+    print("SNAPHU importing...")
+    parameters.put('doNotKeepWrapped', False)
+    products = [source_product, unwrapped_product]
+    output = GPF.createProduct('SnaphuImport', parameters, products)
+    print("SNAPHU imported...")
+    return output  
+def terrain_correction_slc(product, DEM):
     """
     Apply terrain correction to a SAR product using a specified DEM.
 
@@ -492,7 +953,7 @@ def terrain_correction(product, DEM):
     viewing geometry. This step geocodes the image into a map coordinate system 
     and ensures that pixel locations align with their true geographic position.
 
-    Parameters
+    Args
     ----------
     product : snappy.Product
         The SAR product to which terrain correction will be applied.
@@ -520,3 +981,124 @@ def terrain_correction(product, DEM):
     output = GPF.createProduct("Terrain-Correction", parameters, product)
     print("Terrain Correction applied!")
     return output
+
+def save_product(product, filename, output_dir="_results", fmt="BEAM-DIMAP"):
+    """
+    Save a SNAP product to disk.
+
+    Args
+    ----------
+    product : snappy.Product
+        The SNAP product to save.
+    filename : str
+        Output filename (without extension).
+    output_dir : str, optional
+        Directory where results will be saved (default: "_results").
+    fmt : str, optional
+        Output format (default: "BEAM-DIMAP").
+
+    Returns
+    -------
+    str
+        The full output path where the product was saved.
+    """
+    out_path = f"{output_dir}/{filename}"
+    print(f"Saving product to {out_path} ({fmt})...")
+    ProductIO.writeProduct(product, out_path, fmt)
+    print("Product saved successfully.")
+    return out_path
+
+
+def plot(
+    dim_path,
+    i_band=None, q_band=None, coh_band=None,
+    downsample=1,
+    fade=(0.2, 0.8),          # (min,max) brightness from coherence
+    title="",
+    save_path=None,
+    return_rgb=False,
+    ax=None,
+):
+    """
+    Visualize an interferogram as SNAP-like rainbow (HSV). This can be used to plot any interferogram outputs
+
+    Args:
+      dim_path   : path to the .dim file (next to the .data/ folder)
+      i_band     : name of the real (i) interferogram band; auto-detected if None
+      q_band     : name of the imag (q) interferogram band; auto-detected if None
+      coh_band   : name of the coherence band; auto-detected if None
+      downsample : integer stride for quick viewing (e.g., 2, 4)
+      fade       : tuple (v_min, v_max) mapping coherence → value (brightness)
+      title      : plot title
+      save_path  : if set, write the RGB to this path (e.g., 'phase.png')
+      return_rgb : if True, return the RGB numpy array
+      ax         : optional matplotlib axes to draw on
+
+    Returns:
+      rgb (H,W,3) array if return_rgb=True, else None.
+    """
+    p = ProductIO.readProduct(dim_path)
+    try:
+        # --- band auto-detect (if names not given) ---
+        names = list(p.getBandNames())
+        def pick(prefix):
+            for n in names:
+                nn = n.lower()
+                if nn.startswith(prefix):  # strict startswith
+                    return n
+            for n in names:                 # fallback: contains
+                if prefix in n.lower():
+                    return n
+            return None
+
+        i_band  = i_band  or pick('i_ifg')
+        q_band  = q_band  or pick('q_ifg')
+        coh_band = coh_band or pick('coh_')
+
+        if not (i_band and q_band and coh_band):
+            raise ValueError(
+                f"Could not find required bands. "
+                f"i_band={i_band}, q_band={q_band}, coh_band={coh_band}. "
+                f"Available: {names[:12]}{' ...' if len(names)>12 else ''}"
+            )
+
+        w, h = p.getSceneRasterWidth(), p.getSceneRasterHeight()
+        buf = np.zeros(w*h, np.float32)
+
+        bi = p.getBand(i_band); bi.readPixels(0,0,w,h,buf); i = buf.reshape(h,w).copy()
+        bq = p.getBand(q_band); bq.readPixels(0,0,w,h,buf); q = buf.reshape(h,w).copy()
+        bc = p.getBand(coh_band); bc.readPixels(0,0,w,h,buf); coh = buf.reshape(h,w).copy()
+
+        if downsample and downsample > 1:
+            s = slice(None, None, int(downsample))
+            i, q, coh = i[s, s], q[s, s], coh[s, s]
+
+        # --- phase → HSV ---
+        phase = np.arctan2(q, i)                         # [-pi, +pi]
+        hue   = (phase + np.pi) / (2*np.pi)              # [0,1]
+        sat   = np.ones_like(hue)
+        vmin, vmax = fade
+        val   = vmin + (vmax - vmin) * np.clip(coh, 0, 1)
+
+        rgb = hsv_to_rgb(np.dstack([hue, sat, val]))
+
+        # --- plot ---
+        if ax is None:
+            plt.figure(figsize=(10, 6))
+            ax = plt.gca()
+        ax.imshow(rgb, origin="upper")
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.set_title(title)
+
+        if save_path:
+            # matplotlib expects 0..1 floats; rgb already is
+            plt.imsave(save_path, rgb)
+
+        return rgb if return_rgb else None
+
+    finally:
+        try:
+            p.dispose()
+        except Exception:
+
+          
